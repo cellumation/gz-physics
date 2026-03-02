@@ -21,6 +21,8 @@
 #include <utility>
 
 #include <dart/collision/CollisionObject.hpp>
+#include <dart/collision/ode/OdeCollisionGroup.hpp>
+#include <gz/common/Console.hh>
 
 #include <BulletCollision/CollisionDispatch/btCollisionWorld.h>
 
@@ -115,6 +117,7 @@ bool GzCollisionDetector::BatchRaycast(
 GzOdeCollisionDetector::GzOdeCollisionDetector()
   : OdeCollisionDetector(), GzCollisionDetector()
 {
+
 }
 
 /////////////////////////////////////////////////
@@ -138,6 +141,25 @@ std::shared_ptr<GzOdeCollisionDetector> GzOdeCollisionDetector::create()
   return std::shared_ptr<GzOdeCollisionDetector>(new GzOdeCollisionDetector());
 }
 
+class GzOdeCollisionGroup : public OdeCollisionGroup
+{
+  friend class GzOdeCollisionDetector;
+public:
+  /// Constructor
+  GzOdeCollisionGroup(const CollisionDetectorPtr& collisionDetector) : OdeCollisionGroup(collisionDetector) {};
+
+  /// Destructor
+  virtual ~GzOdeCollisionGroup() = default;
+
+  using OdeCollisionGroup::getOdeSpaceId;
+
+};
+
+std::unique_ptr<CollisionGroup> GzOdeCollisionDetector::createCollisionGroup()
+{
+  return std::make_unique<GzOdeCollisionGroup>(shared_from_this());
+}
+
 /////////////////////////////////////////////////
 bool GzOdeCollisionDetector::collide(
     CollisionGroup *_group,
@@ -159,6 +181,110 @@ bool GzOdeCollisionDetector::collide(
   bool ret = OdeCollisionDetector::collide(_group1, _group2, _option, _result);
   this->LimitCollisionPairMaxContacts(_result);
   return ret;
+}
+
+void NearCallback(void *_data, dGeomID _o1, dGeomID _o2)
+{
+  // Check space
+  if (dGeomIsSpace(_o1) || dGeomIsSpace(_o2))
+  {
+    dSpaceCollide2(_o1, _o2, _data, &NearCallback);
+    return;
+  }
+
+  // Identify the ray
+  dGeomID ray = nullptr;
+  dGeomID other = nullptr;
+
+  if (dGeomGetClass(_o1) != dRayClass)
+  {
+    ray = _o1;
+    other = _o2;
+    return;
+  }
+  if (dGeomGetClass(_o2) != dRayClass)
+  {
+    ray = _o2;
+    other = _o1;
+    return;
+  }
+
+  if(ray == nullptr)
+  {
+    // should not happen, but to be safe...
+    return;
+  }
+
+  dContactGeom contact;
+
+  RaycastResult* result = static_cast<RaycastResult*>(_data);
+
+  auto setResult = [&](dart::collision::RayHit &rayHit)
+  {
+      auto geomData = dGeomGetData(other);
+      rayHit.mFraction = contact.depth;
+      rayHit.mNormal = Eigen::Vector3d(contact.normal);
+      rayHit.mPoint = Eigen::Vector3d(contact.pos);
+      rayHit.mCollisionObject = static_cast<dart::collision::CollisionObject*>(geomData);
+  };
+
+  // param 3 makes sure that we only generate one collision per call
+  if(dCollide(ray, other, 1, &contact, sizeof(dContactGeom)) > 0)
+  {
+    if(result->mRayHits.empty())
+    {
+      setResult(result->mRayHits.emplace_back());
+    }
+    else
+    {
+      setResult(result->mRayHits.front());
+    }
+
+    // shorten the ray to ignore any collision that is further away.
+    // as we only support nearest collision, this is valid and fast
+    dGeomRaySetLength(ray, contact.depth);
+  }
+}
+
+bool GzOdeCollisionDetector::raycast(
+      CollisionGroup* group,
+      const Eigen::Vector3d& from,
+      const Eigen::Vector3d& to,
+      const RaycastOption& option,
+      RaycastResult* result)
+{
+  if(option.mEnableAllHits)
+  {
+      gzwarn << "raycast multihit support is not implemented for ODE" << std::endl;
+      return false;
+  }
+
+  // Note, this is UB as we are casting into our own derived function,
+  // but as this is the only way to get the space ID this is the way
+  // to go here...
+  auto odeGroup = static_cast<GzOdeCollisionGroup *>(group);
+
+  dGeomID rayId = dCreateRay(odeGroup->getOdeSpaceId(), 1.0);
+
+  const Eigen::Vector3d dirNonNormalized(to - from);
+  const double length = dirNonNormalized.norm();
+  if(length <= 1e-7)
+  {
+    return false;
+  }
+
+  const Eigen::Vector3d dir(dirNonNormalized / length);
+
+  dGeomRaySet(rayId, from.x(), from.y(), from.z(), dir.x(), dir.y(), dir.z());
+  dGeomRaySetLength(rayId, length);
+
+  dGeomRaySetClosestHit(rayId, 1);
+
+  dSpaceCollide2(rayId, reinterpret_cast<dGeomID>(odeGroup->getOdeSpaceId()), result,
+         &NearCallback);
+
+  // near callback updated our ray hit result now (or not)
+  return !result->mRayHits.empty();
 }
 
 /////////////////////////////////////////////////
