@@ -278,7 +278,7 @@ SimulationFeatures::GetBatchRayIntersectionFromLastStep(
     }
   }
 
-  results.assign(_rays.size(), {false, kNaNVec, kNaN, kNaNVec});
+  results.assign(_rays.size(), {kNaNVec, kNaN, kNaNVec});
   return results;
 }
 
