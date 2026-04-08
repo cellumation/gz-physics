@@ -2221,7 +2221,7 @@ TYPED_TEST(SimulationFeaturesRayIntersectionTest, SupportedRayIntersections)
 
       ASSERT_TRUE(rayIntersection.point.array().isNaN().any());
       ASSERT_TRUE(rayIntersection.normal.array().isNaN().any());
-      ASSERT_TRUE(std::isnan(rayIntersection.fraction));
+      ASSERT_TRUE(std::isinf(rayIntersection.fraction));
     }
   }
 }
@@ -2254,7 +2254,7 @@ TYPED_TEST(SimulationFeaturesRayIntersectionTest, UnsupportedRayIntersections)
 
       ASSERT_TRUE(rayIntersection.point.array().isNaN().any());
       ASSERT_TRUE(rayIntersection.normal.array().isNaN().any());
-      ASSERT_TRUE(std::isnan(rayIntersection.fraction));
+      ASSERT_TRUE(std::isinf(rayIntersection.fraction));
     }
   }
 }
