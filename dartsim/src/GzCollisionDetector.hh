@@ -126,6 +126,11 @@ class GzOdeCollisionDetector :
       const RaycastOption& option = RaycastOption(),
       RaycastResult* result = nullptr) override;
 
+  public: virtual bool BatchRaycast(
+      CollisionGroup *_group,
+      const std::vector<GzRay> &_rays,
+      std::vector<GzRayResult> &_results) const override;
+
   /// \brief Create the GzOdeCollisionDetector
   public: static std::shared_ptr<GzOdeCollisionDetector> create();
 
