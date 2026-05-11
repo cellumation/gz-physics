@@ -155,13 +155,9 @@ class GzOdeCollisionGroup : public OdeCollisionGroup
   friend class GzOdeCollisionDetector;
 public:
   /// Constructor
-  GzOdeCollisionGroup(const CollisionDetectorPtr& collisionDetector) : OdeCollisionGroup(collisionDetector) {};
-
-  /// Destructor
-  virtual ~GzOdeCollisionGroup() = default;
+  using OdeCollisionGroup::OdeCollisionGroup;
 
   using OdeCollisionGroup::getOdeSpaceId;
-
 };
 
 std::unique_ptr<CollisionGroup> GzOdeCollisionDetector::createCollisionGroup()
@@ -197,6 +193,7 @@ void NearCallback(void *_data, dGeomID _o1, dGeomID _o2)
   // Check space
   if (dGeomIsSpace(_o1) || dGeomIsSpace(_o2))
   {
+//     gzwarn << "NearCallback : space collision\n";
     dSpaceCollide2(_o1, _o2, _data, &NearCallback);
     return;
   }
@@ -205,17 +202,15 @@ void NearCallback(void *_data, dGeomID _o1, dGeomID _o2)
   dGeomID ray = nullptr;
   dGeomID other = nullptr;
 
-  if (dGeomGetClass(_o1) != dRayClass)
+  if (dGeomGetClass(_o1) == dRayClass)
   {
     ray = _o1;
     other = _o2;
-    return;
   }
-  if (dGeomGetClass(_o2) != dRayClass)
+  if (dGeomGetClass(_o2) == dRayClass)
   {
     ray = _o2;
     other = _o1;
-    return;
   }
 
   if(ray == nullptr)
@@ -248,10 +243,6 @@ void NearCallback(void *_data, dGeomID _o1, dGeomID _o2)
     {
       setResult(result->mRayHits.front());
     }
-
-    // shorten the ray to ignore any collision that is further away.
-    // as we only support nearest collision, this is valid and fast
-    dGeomRaySetLength(ray, contact.depth);
   }
 }
 
@@ -268,9 +259,6 @@ bool GzOdeCollisionDetector::raycast(
       return false;
   }
 
-  // Note, this is UB as we are casting into our own derived function,
-  // but as this is the only way to get the space ID this is the way
-  // to go here...
   auto odeGroup = static_cast<GzOdeCollisionGroup *>(group);
 
   dGeomID rayId = dCreateRay(odeGroup->getOdeSpaceId(), 1.0);
@@ -292,8 +280,55 @@ bool GzOdeCollisionDetector::raycast(
   dSpaceCollide2(rayId, reinterpret_cast<dGeomID>(odeGroup->getOdeSpaceId()), result,
          &NearCallback);
 
+  dGeomDestroy(rayId);
+
   // near callback updated our ray hit result now (or not)
   return !result->mRayHits.empty();
+}
+
+bool GzOdeCollisionDetector::BatchRaycast(
+      CollisionGroup *_group,
+      const std::vector<GzRay> &_rays,
+      std::vector<GzRayResult> &_results) const
+{
+  auto odeGroup = static_cast<GzOdeCollisionGroup *>(_group);
+
+  dGeomID rayId = dCreateRay(odeGroup->getOdeSpaceId(), 1.0);
+  dGeomRaySetClosestHit(rayId, 1);
+
+  _results.reserve(_rays.size());
+  RaycastResult result;
+  for(const GzRay &ray : _rays)
+  {
+    const Eigen::Vector3d dirNonNormalized(ray.to - ray.from);
+    const double length = dirNonNormalized.norm();
+    result.clear();
+    if(length > 1e-7)
+    {
+      const Eigen::Vector3d dir(dirNonNormalized / length);
+
+      dGeomRaySet(rayId, ray.from.x(), ray.from.y(), ray.from.z(), dir.x(), dir.y(), dir.z());
+      dGeomRaySetLength(rayId, length);
+
+      dSpaceCollide2(rayId, reinterpret_cast<dGeomID>(odeGroup->getOdeSpaceId()), &result,
+            &NearCallback);
+    }
+
+    // near callback updated our ray hit result now (or not)
+    if(result.hasHit())
+    {
+      RayHit &rayHit(result.mRayHits.front());
+      _results.emplace_back(GzRayResult{result.hasHit(), rayHit.mPoint, rayHit.mFraction , rayHit.mNormal});
+    }
+    else
+    {
+      _results.emplace_back(GzRayResult{result.hasHit(), Eigen::Vector3d::Constant(std::numeric_limits<double>::quiet_NaN()), std::numeric_limits<double>::quiet_NaN() , Eigen::Vector3d::Constant(std::numeric_limits<double>::quiet_NaN())});
+    }
+  }
+
+  dGeomDestroy(rayId);
+
+  return true;
 }
 
 /////////////////////////////////////////////////
@@ -331,7 +366,7 @@ GzBulletCollisionDetector::GzBulletCollisionDetector()
 std::unique_ptr<dart::collision::CollisionGroup>
 GzBulletCollisionDetector::createCollisionGroup()
 {
-  return std::make_unique<GzBulletCollisionGroup>(this->shared_from_this());
+  return std::make_unique<GzBulletCollisionGroup>(shared_from_this());
 }
 
 /////////////////////////////////////////////////
