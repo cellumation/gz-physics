@@ -300,14 +300,14 @@ bool GzOdeCollisionDetector::BatchRaycast(
   RaycastResult result;
   for(const GzRay &ray : _rays)
   {
-    const Eigen::Vector3d dirNonNormalized(ray.to - ray.from);
+    const Eigen::Vector3d dirNonNormalized(ray.target - ray.origin);
     const double length = dirNonNormalized.norm();
     result.clear();
     if(length > 1e-7)
     {
       const Eigen::Vector3d dir(dirNonNormalized / length);
 
-      dGeomRaySet(rayId, ray.from.x(), ray.from.y(), ray.from.z(), dir.x(), dir.y(), dir.z());
+      dGeomRaySet(rayId, ray.origin.x(), ray.origin.y(), ray.origin.z(), dir.x(), dir.y(), dir.z());
       dGeomRaySetLength(rayId, length);
 
       dSpaceCollide2(rayId, reinterpret_cast<dGeomID>(odeGroup->getOdeSpaceId()), &result,
@@ -318,11 +318,11 @@ bool GzOdeCollisionDetector::BatchRaycast(
     if(result.hasHit())
     {
       RayHit &rayHit(result.mRayHits.front());
-      _results.emplace_back(GzRayResult{result.hasHit(), rayHit.mPoint, rayHit.mFraction , rayHit.mNormal});
+      _results.emplace_back(GzRayResult{rayHit.mPoint, rayHit.mFraction , rayHit.mNormal});
     }
     else
     {
-      _results.emplace_back(GzRayResult{result.hasHit(), Eigen::Vector3d::Constant(std::numeric_limits<double>::quiet_NaN()), std::numeric_limits<double>::quiet_NaN() , Eigen::Vector3d::Constant(std::numeric_limits<double>::quiet_NaN())});
+      _results.emplace_back(GzRayResult{Eigen::Vector3d::Constant(std::numeric_limits<double>::quiet_NaN()), std::numeric_limits<double>::infinity() , Eigen::Vector3d::Constant(std::numeric_limits<double>::quiet_NaN())});
     }
   }
 
@@ -330,6 +330,17 @@ bool GzOdeCollisionDetector::BatchRaycast(
 
   return true;
 }
+
+/// \brief Exposes BulletCollisionGroup::getBulletCollisionWorld() which
+/// is protected in the base class.
+class GzBulletCollisionGroup : public dart::collision::BulletCollisionGroup
+{
+  public: explicit GzBulletCollisionGroup(
+      const dart::collision::CollisionDetectorPtr &_detector);
+
+  /// \brief Return the underlying btCollisionWorld
+  public: const btCollisionWorld *getCollisionWorld() const;
+};
 
 /////////////////////////////////////////////////
 GzBulletCollisionGroup::GzBulletCollisionGroup(
@@ -344,17 +355,6 @@ const btCollisionWorld *GzBulletCollisionGroup::getCollisionWorld() const
   // getBulletCollisionWorld() is protected in BulletCollisionGroup.
   return this->getBulletCollisionWorld();
 }
-
-/// \brief Exposes BulletCollisionGroup::getBulletCollisionWorld() which
-/// is protected in the base class.
-class GzBulletCollisionGroup : public dart::collision::BulletCollisionGroup
-{
-  public: explicit GzBulletCollisionGroup(
-      const dart::collision::CollisionDetectorPtr &_detector);
-
-  /// \brief Return the underlying btCollisionWorld
-  public: const btCollisionWorld *getCollisionWorld() const;
-};
 
 /////////////////////////////////////////////////
 GzBulletCollisionDetector::GzBulletCollisionDetector()
