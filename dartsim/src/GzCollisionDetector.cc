@@ -296,6 +296,7 @@ bool GzOdeCollisionDetector::BatchRaycast(
   dGeomID rayId = dCreateRay(odeGroup->getOdeSpaceId(), 1.0);
   dGeomRaySetClosestHit(rayId, 1);
 
+  _results.clear();
   _results.reserve(_rays.size());
   RaycastResult result;
   for(const GzRay &ray : _rays)
