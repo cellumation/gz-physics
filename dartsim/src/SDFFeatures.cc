@@ -45,10 +45,16 @@
 #include <dart/dynamics/WeldJoint.hpp>
 
 #include <gz/common/Console.hh>
+#include <gz/common/Filesystem.hh>
 #include <gz/common/Mesh.hh>
 #include <gz/common/MeshManager.hh>
+#include <gz/common/URI.hh>
+#include <gz/common/Util.hh>
+#include <gz/common/Uuid.hh>
+#include <gz/common/geospatial/HeightmapUtil.hh>
 #include <gz/math/eigen3/Conversions.hh>
 #include <gz/math/Helpers.hh>
+#include <gz/math/SphericalCoordinates.hh>
 
 #include <sdf/Box.hh>
 #include <sdf/Collision.hh>
@@ -64,6 +70,7 @@
 #include <sdf/Material.hh>
 #include <sdf/Mesh.hh>
 #include <sdf/Model.hh>
+#include <sdf/Polyline.hh>
 #include <sdf/Sphere.hh>
 #include <sdf/Types.hh>
 #include <sdf/Visual.hh>
@@ -71,6 +78,7 @@
 
 #include "AddedMassFeatures.hh"
 #include "CustomConeMeshShape.hh"
+#include "CustomHeightmapShape.hh"
 #include "CustomMeshShape.hh"
 
 namespace gz {
@@ -341,34 +349,148 @@ static ShapeAndTransform ConstructPlane(
 }
 
 /////////////////////////////////////////////////
-static ShapeAndTransform ConstructHeightmap(
-    const ::sdf::Heightmap & /*_heightmap*/)
+static std::string AsFullPath(
+    const std::string &_uri,
+    const std::string &_filePath)
 {
-  // TODO(mjcarroll) Allow dartsim to construct heightmaps internally rather
-  // than relying on the physics consumer constructing and attaching:
-  // https://github.com/gazebosim/gz-physics/issues/451
-  gzdbg << "Heightmap construction from an SDF has not been implemented yet "
-        << "for dartsim. Use AttachHeightmapShapeFeature to use heightmaps.\n";
-  return {nullptr};
+  if (_filePath.empty())
+    return _uri;
+  if (_uri.find("://") != std::string::npos || !common::isRelativePath(_uri))
+    return _uri;
+  return common::joinPaths(common::parentPath(_filePath), _uri);
+}
+
+/////////////////////////////////////////////////
+static ShapeAndTransform ConstructHeightmap(
+    const ::sdf::Heightmap &_heightmap,
+    const math::SphericalCoordinates &_sphericalCoords)
+{
+  auto fullPath = common::findFile(
+      AsFullPath(_heightmap.Uri(), _heightmap.FilePath()));
+  if (fullPath.empty())
+  {
+    gzwarn << "Heightmap geometry missing URI" << std::endl;
+    return {nullptr};
+  }
+
+  std::unique_ptr<common::HeightmapData> data;
+  if (common::isSupportedImageHeightmapFileExtension(fullPath))
+  {
+    data = common::loadHeightmapData(fullPath);
+  }
+  else
+  {
+    data = common::loadHeightmapData(fullPath, _sphericalCoords);
+  }
+
+  if (!data)
+  {
+    gzwarn << "Failed to load heightmap [" << fullPath << "]" << std::endl;
+    return {nullptr};
+  }
+
+  auto heightmap = std::make_shared<CustomHeightmapShape>(
+      *data,
+      math::eigen3::convert(_heightmap.Size()),
+      _heightmap.Sampling());
+  return {heightmap};
 }
 
 /////////////////////////////////////////////////
 static ShapeAndTransform ConstructMesh(
-    const ::sdf::Mesh & /*_mesh*/)
+    const ::sdf::Mesh &_mesh)
 {
-  // TODO(MXG): Look into what kind of mesh URI we get here. Will it just be
-  // a local file name, or do we need to resolve the URI?
-  // TODO(mjcarroll) Allow dartsim to construct meshes internally rather
-  // than relying on the physics consumer constructing and attaching:
-  // https://github.com/gazebosim/gz-physics/issues/451
-  gzdbg << "Mesh construction from an SDF has not been implemented yet for "
-        << "dartsim. Use AttachMeshShapeFeature to use mesh shapes.\n";
-  return {nullptr};
+  common::MeshManager *meshManager = common::MeshManager::Instance();
+  const common::Mesh *mesh = nullptr;
+
+  if (common::URI(_mesh.Uri()).Scheme() == "name")
+  {
+    const std::string basename = common::basename(_mesh.Uri());
+    mesh = meshManager->MeshByName(basename);
+    if (nullptr == mesh)
+    {
+      gzwarn << "Failed to load mesh by name [" << basename
+             << "]." << std::endl;
+      return {nullptr};
+    }
+  }
+  else
+  {
+    auto fullPath = common::findFile(
+        AsFullPath(_mesh.Uri(), _mesh.FilePath()));
+    if (fullPath.empty())
+    {
+      gzwarn << "Failed to find mesh [" << _mesh.Uri() << "]" << std::endl;
+      return {nullptr};
+    }
+    mesh = meshManager->Load(fullPath);
+    if (nullptr == mesh)
+    {
+      gzwarn << "Failed to load mesh from [" << fullPath
+             << "]." << std::endl;
+      return {nullptr};
+    }
+  }
+
+  if (_mesh.Optimization() != ::sdf::MeshOptimization::NONE)
+  {
+    std::size_t maxConvexHulls = 16u;
+    std::size_t voxelResolution = 200000u;
+    if (_mesh.ConvexDecomposition())
+    {
+      maxConvexHulls = _mesh.ConvexDecomposition()->MaxConvexHulls();
+      voxelResolution = _mesh.ConvexDecomposition()->VoxelResolution();
+    }
+    if (_mesh.Optimization() == ::sdf::MeshOptimization::CONVEX_HULL)
+      maxConvexHulls = 1u;
+
+    const common::Mesh *optimizedMesh = meshManager->OptimizeMesh(
+        *mesh, _mesh.Submesh(), _mesh.CenterSubmesh(),
+        maxConvexHulls, voxelResolution);
+    if (optimizedMesh && optimizedMesh->SubMeshCount() > 0u)
+      mesh = optimizedMesh;
+  }
+
+  auto meshShape = std::make_shared<CustomMeshShape>(
+      *mesh, math::eigen3::convert(_mesh.Scale()));
+  auto mesh2 = std::dynamic_pointer_cast<dart::dynamics::MeshShape>(meshShape);
+  return {mesh2};
+}
+
+/////////////////////////////////////////////////
+static ShapeAndTransform ConstructPolyline(
+    const std::vector<::sdf::Polyline> &_polylines)
+{
+  if (_polylines.empty())
+    return {nullptr};
+
+  std::vector<std::vector<math::Vector2d>> vertices;
+  for (const auto &polyline : _polylines)
+  {
+    vertices.push_back(polyline.Points());
+  }
+
+  std::string name("POLYLINE_" + common::Uuid().String());
+  common::MeshManager *meshManager = common::MeshManager::Instance();
+  meshManager->CreateExtrudedPolyline(name, vertices, _polylines[0].Height());
+
+  const common::Mesh *mesh = meshManager->MeshByName(name);
+  if (nullptr == mesh)
+  {
+    gzwarn << "Failed to create polyline mesh." << std::endl;
+    return {nullptr};
+  }
+
+  auto meshShape = std::make_shared<CustomMeshShape>(
+      *mesh, math::eigen3::convert(math::Vector3d(1, 1, 1)));
+  auto mesh2 = std::dynamic_pointer_cast<dart::dynamics::MeshShape>(meshShape);
+  return {mesh2};
 }
 
 /////////////////////////////////////////////////
 static ShapeAndTransform ConstructGeometry(
-    const ::sdf::Geometry &_geometry)
+    const ::sdf::Geometry &_geometry,
+    const math::SphericalCoordinates &_sphericalCoords)
 {
   if (_geometry.BoxShape())
     return ConstructBox(*_geometry.BoxShape());
@@ -420,7 +542,9 @@ static ShapeAndTransform ConstructGeometry(
   else if (_geometry.MeshShape())
     return ConstructMesh(*_geometry.MeshShape());
   else if (_geometry.HeightmapShape())
-    return ConstructHeightmap(*_geometry.HeightmapShape());
+    return ConstructHeightmap(*_geometry.HeightmapShape(), _sphericalCoords);
+  else if (!_geometry.PolylineShape().empty())
+    return ConstructPolyline(_geometry.PolylineShape());
 
   return {nullptr};
 }
@@ -526,6 +650,11 @@ Identity SDFFeatures::ConstructSdfWorld(
   const dart::simulation::WorldPtr &world = this->worlds.at(worldID);
 
   world->setGravity(math::eigen3::convert(_sdfWorld.Gravity()));
+
+  if (_sdfWorld.SphericalCoordinates())
+    this->worldSphericalCoordinates = *_sdfWorld.SphericalCoordinates();
+  else
+    this->worldSphericalCoordinates = math::SphericalCoordinates();
 
   // TODO(MXG): Add a Physics class to the SDFormat DOM and then parse that
   // information here. For now, we'll just use dartsim's default physics
@@ -886,7 +1015,8 @@ Identity SDFFeatures::ConstructSdfCollision(
     return this->GenerateInvalidId();
   }
 
-  const ShapeAndTransform st = ConstructGeometry(*_collision.Geom());
+  const ShapeAndTransform st = ConstructGeometry(
+      *_collision.Geom(), this->worldSphericalCoordinates);
   const dart::dynamics::ShapePtr shape = st.shape;
   const Eigen::Isometry3d tf_shape = st.tf;
 
@@ -1025,7 +1155,8 @@ Identity SDFFeatures::ConstructSdfVisual(
     return this->GenerateInvalidId();
   }
 
-  const ShapeAndTransform st = ConstructGeometry(*_visual.Geom());
+  const ShapeAndTransform st = ConstructGeometry(
+      *_visual.Geom(), this->worldSphericalCoordinates);
   const dart::dynamics::ShapePtr shape = st.shape;
   const Eigen::Isometry3d tf_shape = st.tf;
 

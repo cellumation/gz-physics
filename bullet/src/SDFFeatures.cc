@@ -16,6 +16,7 @@
 */
 
 #include "SDFFeatures.hh"
+#include <BulletCollision/Gimpact/btGImpactShape.h>
 #include <gz/math/eigen3/Conversions.hh>
 #include <gz/math/Helpers.hh>
 
@@ -25,9 +26,18 @@
 #include <sdf/Cone.hh>
 #include <sdf/Cylinder.hh>
 #include <sdf/Ellipsoid.hh>
-#include <sdf/Sphere.hh>
+#include <sdf/Mesh.hh>
 #include <sdf/Plane.hh>
+#include <sdf/Polyline.hh>
+#include <sdf/Sphere.hh>
 #include <sdf/JointAxis.hh>
+
+#include <gz/common/Filesystem.hh>
+#include <gz/common/Mesh.hh>
+#include <gz/common/MeshManager.hh>
+#include <gz/common/URI.hh>
+#include <gz/common/Util.hh>
+#include <gz/common/Uuid.hh>
 
 #include <memory>
 
@@ -59,6 +69,18 @@ static math::Pose3d ResolveSdfPose(const ::sdf::SemanticPose &_semPose)
   }
 
   return pose;
+}
+
+/////////////////////////////////////////////////
+static std::string AsFullPath(
+    const std::string &_uri,
+    const std::string &_filePath)
+{
+  if (_filePath.empty())
+    return _uri;
+  if (_uri.find("://") != std::string::npos || !common::isRelativePath(_uri))
+    return _uri;
+  return common::joinPaths(common::parentPath(_filePath), _uri);
 }
 
 /////////////////////////////////////////////////
@@ -215,6 +237,8 @@ Identity SDFFeatures::ConstructSdfCollision(
 
   const auto &geom = _collision.Geom();
   std::shared_ptr<btCollisionShape> shape;
+  std::shared_ptr<btTriangleMesh> triMesh;
+  bool isMesh = false;
 
   if (geom->BoxShape())
   {
@@ -272,6 +296,105 @@ Identity SDFFeatures::ConstructSdfCollision(
     std::dynamic_pointer_cast<btMultiSphereShape>(shape)->setLocalScaling(
         radii);
   }
+  else if (geom->MeshShape() || !geom->PolylineShape().empty())
+  {
+    common::MeshManager *meshManager = common::MeshManager::Instance();
+    const common::Mesh *mesh = nullptr;
+    Eigen::Vector3d scale = Eigen::Vector3d::Ones();
+
+    if (geom->MeshShape())
+    {
+      const auto *meshSdf = geom->MeshShape();
+      scale = math::eigen3::convert(meshSdf->Scale());
+      auto fullPath = common::findFile(
+          AsFullPath(meshSdf->Uri(), meshSdf->FilePath()));
+      if (fullPath.empty())
+      {
+        gzwarn << "Failed to find mesh [" << meshSdf->Uri() << "]"
+               << std::endl;
+        return this->GenerateInvalidId();
+      }
+      mesh = meshManager->Load(fullPath);
+      if (mesh && meshSdf->Optimization() != ::sdf::MeshOptimization::NONE)
+      {
+        std::size_t maxConvexHulls = 16u;
+        std::size_t voxelResolution = 200000u;
+        if (meshSdf->ConvexDecomposition())
+        {
+          maxConvexHulls = meshSdf->ConvexDecomposition()->MaxConvexHulls();
+          voxelResolution = meshSdf->ConvexDecomposition()->VoxelResolution();
+        }
+        if (meshSdf->Optimization() == ::sdf::MeshOptimization::CONVEX_HULL)
+          maxConvexHulls = 1u;
+
+        const common::Mesh *optimizedMesh = meshManager->OptimizeMesh(
+            *mesh, meshSdf->Submesh(), meshSdf->CenterSubmesh(),
+            maxConvexHulls, voxelResolution);
+        if (optimizedMesh && optimizedMesh->SubMeshCount() > 0u)
+          mesh = optimizedMesh;
+      }
+    }
+    else
+    {
+      std::vector<std::vector<math::Vector2d>> vertices;
+      for (const auto &polyline : geom->PolylineShape())
+      {
+        vertices.push_back(polyline.Points());
+      }
+      std::string name("POLYLINE_" + common::Uuid().String());
+      meshManager->CreateExtrudedPolyline(
+          name, vertices, geom->PolylineShape()[0].Height());
+      mesh = meshManager->MeshByName(name);
+    }
+
+    if (nullptr == mesh)
+    {
+      gzwarn << "Failed to load mesh for collision ["
+             << _collision.Name() << "]" << std::endl;
+      return this->GenerateInvalidId();
+    }
+
+    double *vertices = nullptr;
+    int *indices = nullptr;
+    mesh->FillArrays(&vertices, &indices);
+
+    const unsigned int numVertices = mesh->VertexCount();
+    const unsigned int numIndices = mesh->IndexCount();
+
+    for (unsigned int j = 0; j < numVertices; ++j)
+    {
+      vertices[j*3+0] = vertices[j*3+0] * scale[0];
+      vertices[j*3+1] = vertices[j*3+1] * scale[1];
+      vertices[j*3+2] = vertices[j*3+2] * scale[2];
+    }
+
+    const auto mTriMesh = std::make_shared<btTriangleMesh>();
+    for (unsigned int j = 0; j < numIndices; j += 3)
+    {
+      btVector3 bv0(static_cast<btScalar>(vertices[indices[j]*3+0]),
+                    static_cast<btScalar>(vertices[indices[j]*3+1]),
+                    static_cast<btScalar>(vertices[indices[j]*3+2]));
+      btVector3 bv1(static_cast<btScalar>(vertices[indices[j+1]*3+0]),
+                    static_cast<btScalar>(vertices[indices[j+1]*3+1]),
+                    static_cast<btScalar>(vertices[indices[j+1]*3+2]));
+      btVector3 bv2(static_cast<btScalar>(vertices[indices[j+2]*3+0]),
+                    static_cast<btScalar>(vertices[indices[j+2]*3+1]),
+                    static_cast<btScalar>(vertices[indices[j+2]*3+2]));
+
+      mTriMesh->addTriangle(bv0, bv1, bv2);
+    }
+
+    delete [] vertices;
+    delete [] indices;
+
+    auto gimpactMeshShape =
+        std::make_shared<btGImpactMeshShape>(mTriMesh.get());
+    gimpactMeshShape->updateBound();
+
+    shape = gimpactMeshShape;
+    triMesh = mTriMesh;
+    isMesh = true;
+  }
 
   // TODO(lobotuerk/blast545) Add additional friction parameters for bullet
   // Currently supporting mu and mu2
@@ -314,7 +437,7 @@ Identity SDFFeatures::ConstructSdfCollision(
 
     auto identity =
       this->AddCollision(_linkID, {
-      _collision.Name(), shape, _linkID, modelID, pose, false, nullptr});
+      _collision.Name(), shape, _linkID, modelID, pose, isMesh, triMesh});
     return identity;
   }
   return this->GenerateInvalidId();
