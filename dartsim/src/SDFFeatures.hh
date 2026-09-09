@@ -19,6 +19,7 @@
 #define GZ_PHYSICS_DARTSIM_SRC_SDFFEATURES_HH_
 
 #include <gz/math/Inertial.hh>
+#include <gz/math/SphericalCoordinates.hh>
 #include <string>
 #include <utility>
 
@@ -137,6 +138,10 @@ class GZ_PHYSICS_DARTSIM_PLUGIN_VISIBLE SDFFeatures :
                                 const ::sdf::Joint *_sdfJoint,
                                 const std::string &_parentName,
                                 const std::string &_parentType) const;
+
+  /// \brief Cached spherical coordinates for the current world, used when
+  /// loading DEM heightmaps.
+  private: math::SphericalCoordinates worldSphericalCoordinates;
 };
 
 }

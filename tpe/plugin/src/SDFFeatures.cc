@@ -22,10 +22,20 @@
 #include <sdf/Cone.hh>
 #include <sdf/Cylinder.hh>
 #include <sdf/Ellipsoid.hh>
+#include <sdf/Mesh.hh>
+#include <sdf/Polyline.hh>
 #include <sdf/Sphere.hh>
 #include <sdf/Geometry.hh>
 #include <sdf/World.hh>
 #include <gz/common/Console.hh>
+#include <gz/common/Filesystem.hh>
+#include <gz/common/Mesh.hh>
+#include <gz/common/MeshManager.hh>
+#include <gz/common/URI.hh>
+#include <gz/common/Util.hh>
+#include <gz/common/Uuid.hh>
+#include <gz/math/eigen3/Conversions.hh>
+#include <gz/math/Pose3.hh>
 
 namespace gz {
 namespace physics {
@@ -55,6 +65,18 @@ static math::Pose3d ResolveSdfPose(const ::sdf::SemanticPose &_semPose)
     pose = _semPose.RawPose();
   }
   return pose;
+}
+
+/////////////////////////////////////////////////
+static std::string AsFullPath(
+    const std::string &_uri,
+    const std::string &_filePath)
+{
+  if (_filePath.empty())
+    return _uri;
+  if (_uri.find("://") != std::string::npos || !common::isRelativePath(_uri))
+    return _uri;
+  return common::joinPaths(common::parentPath(_filePath), _uri);
 }
 }  // namespace
 
@@ -321,6 +343,75 @@ Identity SDFFeatures::ConstructSdfCollision(
     const auto sphereSdf = geom->SphereShape();
     tpelib::SphereShape shape;
     shape.SetRadius(sphereSdf->Radius());
+    collision->SetShape(shape);
+  }
+  else if (geom->Type() == ::sdf::GeometryType::MESH)
+  {
+    const auto *meshSdf = geom->MeshShape();
+    auto fullPath = common::findFile(
+        AsFullPath(meshSdf->Uri(), meshSdf->FilePath()));
+    if (fullPath.empty())
+    {
+      gzwarn << "Failed to find mesh [" << meshSdf->Uri() << "]" << std::endl;
+      return this->GenerateInvalidId();
+    }
+
+    common::MeshManager *meshManager = common::MeshManager::Instance();
+    const common::Mesh *mesh = meshManager->Load(fullPath);
+    if (!mesh)
+    {
+      gzwarn << "Failed to load mesh [" << fullPath << "]" << std::endl;
+      return this->GenerateInvalidId();
+    }
+
+    if (meshSdf->Optimization() != ::sdf::MeshOptimization::NONE)
+    {
+      std::size_t maxConvexHulls = 16u;
+      std::size_t voxelResolution = 200000u;
+      if (meshSdf->ConvexDecomposition())
+      {
+        maxConvexHulls = meshSdf->ConvexDecomposition()->MaxConvexHulls();
+        voxelResolution = meshSdf->ConvexDecomposition()->VoxelResolution();
+      }
+      if (meshSdf->Optimization() == ::sdf::MeshOptimization::CONVEX_HULL)
+        maxConvexHulls = 1u;
+
+      const common::Mesh *optimizedMesh = meshManager->OptimizeMesh(
+          *mesh, meshSdf->Submesh(), meshSdf->CenterSubmesh(),
+          maxConvexHulls, voxelResolution);
+      if (optimizedMesh && optimizedMesh->SubMeshCount() > 0u)
+        mesh = optimizedMesh;
+    }
+
+    tpelib::MeshShape shape;
+    shape.SetMesh(*mesh);
+    shape.SetScale(meshSdf->Scale());
+    collision->SetShape(shape);
+  }
+  else if (geom->Type() == ::sdf::GeometryType::POLYLINE)
+  {
+    std::vector<std::vector<math::Vector2d>> vertices;
+    for (const auto &polyline : geom->PolylineShape())
+    {
+      vertices.push_back(polyline.Points());
+    }
+
+    std::string meshName("POLYLINE_" + common::Uuid().String());
+    common::MeshManager *meshManager = common::MeshManager::Instance();
+    meshManager->CreateExtrudedPolyline(
+        meshName, vertices, geom->PolylineShape()[0].Height());
+
+    const common::Mesh *mesh = meshManager->MeshByName(meshName);
+    if (!mesh)
+    {
+      gzwarn << "Failed to create polyline mesh for collision ["
+             << name << "]" << std::endl;
+      return this->GenerateInvalidId();
+    }
+
+    tpelib::MeshShape shape;
+    shape.SetMesh(*mesh);
+    shape.SetScale(math::Vector3d(1, 1, 1));
     collision->SetShape(shape);
   }
   else
